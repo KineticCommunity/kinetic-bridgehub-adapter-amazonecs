@@ -90,12 +90,13 @@ public class AmazonEcsAdapter implements BridgeAdapter {
     private String accessKey;
     private String secretKey;
     private String region;
+    private AmazonEC2Adapter ec2Adapter = null;
         
     /**
      * Structures that are valid to use in the bridge
      */
     public static final List<String> VALID_STRUCTURES = Arrays.asList(new String[] {
-        "Clusters","ContainerInstances","Tasks"
+        "Clusters","ContainerInstances","Tasks","TaskDefinitions"
     });
     
     /*---------------------------------------------------------------------------------------------
@@ -168,38 +169,14 @@ public class AmazonEcsAdapter implements BridgeAdapter {
         // Build the response structure key identifier by lowercase the first letter of the structure
         String structureKeyIdentifier = structure.substring(0, 1).toLowerCase().concat(structure.substring(1,structure.length()-1));
         
-        // Make the call to ECS to retrieve the Arns matching the query
-        JSONObject arnsJson = ecsRequest("List"+structure,query);
-        
-        // Parse through and retrieve the structure Arns that match the query
-        List<String> structureArns = new ArrayList<String>();
-        JSONArray structureArnsXml = (JSONArray)arnsJson.get(structureKeyIdentifier.concat("Arns"));
-        for (Object o : structureArnsXml) {
-            structureArns.add(o.toString());
+        Matcher arnMatch = Pattern.compile("((?:"+structureKeyIdentifier+")?[Aa]rn=(.*?))(?:&|\\z)").matcher(query);
+        if (arnMatch.find()) {
+            String arn = arnMatch.group(2) == null ? "" : arnMatch.group(2);
+            query = query.replace(arnMatch.group(1),structureKeyIdentifier.concat("Arns=["+arn+"]"));
         }
         
-        List<Record> records = new ArrayList<Record>();
-        if (!structureArns.isEmpty()) {
-            // Retrieve the cluster from the original query to append to the describe query (if it was
-            // originally included)
-            String cluster = null;
-            if (!structure.equals("Clusters")) {
-                Matcher m = Pattern.compile("cluster=(.*?)(?:&|\\z)").matcher(query);
-                if (m.find()) cluster = m.group(1);
-            }
-
-            // Make the call to ECS retrieve the record objects for the returned Arns
-            StringBuilder describeQuery = new StringBuilder();
-            describeQuery.append(structureKeyIdentifier).append("s=[").append(StringUtils.join(structureArns,",")).append("]");
-            if (cluster != null) describeQuery.append("&cluster=").append(cluster);
-            JSONObject describeJson = ecsRequest("Describe"+structure,describeQuery.toString());
-            // Parse through the response JSON to build record objects
-            JSONArray structureObjs = (JSONArray)describeJson.get(structureKeyIdentifier.concat("s"));
-            for (Object o : structureObjs) {
-                records.add(new Record((Map)o));
-            }
-        }
-        records = BridgeUtils.getNestedFields(request.getFields(), records);
+        request.setQuery(query);
+        List<Record> records = search(request).getRecords();
         
         Record record;
         if (records.size() > 1) {
@@ -207,15 +184,7 @@ public class AmazonEcsAdapter implements BridgeAdapter {
         } else if (records.isEmpty()) {
             record = new Record(null);
         } else {
-            if (request.getFields() == null || request.getFields().isEmpty()) {
-                record = records.get(0);
-            } else {
-                Map<String,Object> recordObject = new LinkedHashMap<String,Object>();
-                for (String field : request.getFields()) {
-                    recordObject.put(field, records.get(0).getValue(field));
-                }
-                record = new Record(recordObject);
-            }
+            record = records.get(0);
         }
         
         return record;
@@ -235,14 +204,20 @@ public class AmazonEcsAdapter implements BridgeAdapter {
         // Build the response structure key identifier by lowercase the first letter of the structure
         String structureKeyIdentifier = structure.substring(0, 1).toLowerCase().concat(structure.substring(1,structure.length()-1));
         
-        // Make the call to ECS to retrieve the Arns matching the query
-        JSONObject arnsJson = ecsRequest("List"+structure,query);
-        
-        // Parse through and retrieve the structure Arns that match the query
+        Matcher arnsMatcher =Pattern.compile(structureKeyIdentifier+"Arns=\\[(.*?)\\]").matcher(query);
         List<String> structureArns = new ArrayList<String>();
-        JSONArray structureArnsXml = (JSONArray)arnsJson.get(structureKeyIdentifier.concat("Arns"));
-        for (Object o : structureArnsXml) {
-            structureArns.add(o.toString());
+        if (arnsMatcher.find()) {
+            String arns = arnsMatcher.group(1);
+            structureArns = Arrays.asList(arns.split(","));
+        } else {
+            // Make the call to ECS to retrieve the Arns matching the query
+            JSONObject arnsJson = ecsRequest("List"+structure,query);
+            
+            // Parse through and retrieve the structure Arns that match the query
+            JSONArray structureArnsXml = (JSONArray)arnsJson.get(structureKeyIdentifier.concat("Arns"));
+            for (Object o : structureArnsXml) {
+                structureArns.add(o.toString());
+            }
         }
         
         List<Record> records = new ArrayList<Record>();
@@ -250,24 +225,46 @@ public class AmazonEcsAdapter implements BridgeAdapter {
             // Retrieve the cluster from the original query to append to the describe query (if it was
             // originally included)
             String cluster = null;
-            if (!structure.equals("Clusters")) {
+            if (!structure.equals("Clusters") && !structure.equals("TaskDefinitions")) {
                 Matcher m = Pattern.compile("cluster=(.*?)(?:&|\\z)").matcher(query);
                 if (m.find()) cluster = m.group(1);
             }
 
             // Make the call to ECS retrieve the record objects for the returned Arns
-            StringBuilder describeQuery = new StringBuilder();
-            describeQuery.append(structureKeyIdentifier).append("s=[").append(StringUtils.join(structureArns,",")).append("]");
-            if (cluster != null) describeQuery.append("&cluster=").append(cluster);
-            JSONObject describeJson = ecsRequest("Describe"+structure,describeQuery.toString());
+            JSONArray structureObjs;
+            if (structure.equals("TaskDefinitions")) {
+                // Make a different call for TaskDefinitions because it's List and Describe calls use
+                // different singular/plural naming defintions unlike the other structures
+                structureObjs = new JSONArray();
+                for (String taskDefinitionArn : structureArns) {
+                    JSONObject describeJson = ecsRequest("Describe"+structure.substring(0,structure.length()-1),"taskDefinition="+taskDefinitionArn);
+                    JSONObject taskDefinition = (JSONObject)describeJson.get("taskDefinition");
+                    structureObjs.add(taskDefinition);
+                }
+            } else {
+                StringBuilder describeQuery = new StringBuilder();
+                describeQuery.append(structureKeyIdentifier).append("s=[").append(StringUtils.join(structureArns,",")).append("]");
+                if (cluster != null) describeQuery.append("&cluster=").append(cluster);
+                JSONObject describeJson = ecsRequest("Describe"+structure,describeQuery.toString());
+                structureObjs = (JSONArray)describeJson.get(structureKeyIdentifier.concat("s"));
+            }
             // Parse through the response JSON to build record objects
-            JSONArray structureObjs = (JSONArray)describeJson.get(structureKeyIdentifier.concat("s"));
             for (Object o : structureObjs) {
                 records.add(new Record((Map)o));
             }
             
-            if (request.getFields() != null && !request.getFields().isEmpty()) records = addOtherStructureFields(request.getFields(),records,cluster);
+            // Get other structure fields add to the record objects if they were included in the
+            // fields list or were included as a field to query by
+            Matcher matchStructureFields = Pattern.compile("(?:\\A|&)([^&]*?\\..*?)=(?:.*?)(?:\\z|&)").matcher(query);
+            List<String> retrievalFields = new ArrayList<String>();
+            while (matchStructureFields.find()) {
+                retrievalFields.add(matchStructureFields.group(1));
+            }
             
+            if ((request.getFields() != null && !request.getFields().isEmpty()) || !retrievalFields.isEmpty()) {
+                if (request.getFields() != null) retrievalFields.addAll(request.getFields());
+                records = addOtherStructureFields(retrievalFields,records,cluster);
+            }
         }
         
         // Define the fields - if not fields were passed, set they keySet of the a returned objects as
@@ -275,12 +272,13 @@ public class AmazonEcsAdapter implements BridgeAdapter {
         List<String> fields = request.getFields();
         if ((fields == null || fields.isEmpty()) && !records.isEmpty()) fields = new ArrayList<String>(records.get(0).getRecord().keySet());
         
+        records = BridgeUtils.getNestedFields(fields, records);
+        records = filterRecords(records,query);
+        
         // Define the metadata
         Map<String,String> metadata = new LinkedHashMap<String,String>();
         metadata.put("size",String.valueOf(records.size()));
         metadata.put("nextPageToken",null);
-        
-        records = BridgeUtils.getNestedFields(fields, records);
 
         // Returning the response
         return new RecordList(fields, records, metadata);
@@ -336,7 +334,7 @@ public class AmazonEcsAdapter implements BridgeAdapter {
         Map<String,Map<String,Object>> complexObjects = new HashMap<String,Map<String,Object>>();
         
         // Find any complex fields
-        Map<String,List<String>> complexFields = new HashMap<String,List<String>>();
+        Map<String,ArrayList<String>> complexFields = new HashMap<String,ArrayList<String>>();
         Pattern pattern = Pattern.compile("(.*?)\\.(.*?)\\z");
         for (String field : fields) {
             Matcher m = pattern.matcher(field);
@@ -344,7 +342,7 @@ public class AmazonEcsAdapter implements BridgeAdapter {
                 if (complexFields.containsKey(m.group(1))) {
                     complexFields.get(m.group(1)).add(m.group(2));
                 } else {
-                    complexFields.put(m.group(1), Arrays.asList(m.group(2)));
+                    complexFields.put(m.group(1), new ArrayList(Arrays.asList(m.group(2))));
                     complexObjects.put(m.group(1),new HashMap<String,Object>());
                 }
             }
@@ -367,32 +365,64 @@ public class AmazonEcsAdapter implements BridgeAdapter {
             
             // Make the calls to the different structures and populate the complexObject field
             // with the object corresponding to each arn
-            for (Map.Entry<String,List<String>> entry : complexFields.entrySet()) {
-                // Convert structure from containerInstance to DescribeContainerInstances (as an example)
-                StringBuilder action = new StringBuilder("Describe");
-                action.append(entry.getKey().substring(0,1).toUpperCase());
-                action.append(entry.getKey().substring(1)).append("s");
-                // Build query
-                StringBuilder complexQuery = new StringBuilder();
-                complexQuery.append(entry.getKey()).append("s=[");
-                complexQuery.append(StringUtils.join(complexObjects.get(entry.getKey()).keySet(),","));
-                complexQuery.append("]");
-                if (cluster != null) complexQuery.append("&cluster=").append(cluster);
-                JSONObject complexJson = ecsRequest(action.toString(),complexQuery.toString());
-                JSONArray complexObjs = (JSONArray)complexJson.get(entry.getKey().concat("s"));
-                for (Object o : complexObjs) {
-                    JSONObject json = (JSONObject)o;
-                    String arn = (String)json.get(entry.getKey().concat("Arn"));
-                    complexObjects.get(entry.getKey()).put(arn,json);
+            for (Map.Entry<String,ArrayList<String>> entry : complexFields.entrySet()) {
+                // Add the structureId to the list of fields to return
+                String structureId = entry.getKey().equals("instance") ? "instanceId" : entry.getKey().concat("Arn");
+                entry.getValue().add(structureId);
+                
+                RecordList recordList;
+                if (entry.getKey().equals("instance")) {
+                    if (ec2Adapter == null) {
+                        ec2Adapter = new AmazonEC2Adapter();
+                        ec2Adapter.setProperties(getProperties().getValues());
+                        ec2Adapter.initialize();
+                    }
+                    BridgeRequest request = new BridgeRequest();
+                    request.setStructure("Instances");
+                    request.setFields(entry.getValue());
+                    int instanceIdCount = 1;
+                    Set<String> instanceIds = complexObjects.get(entry.getKey()).keySet();
+                    StringBuilder query = new StringBuilder();
+                    for (String instanceId : instanceIds) {
+                        query.append("InstanceId.").append(instanceIdCount).append("=");
+                        query.append(instanceId);
+                        instanceIdCount++;
+                        if (instanceIdCount != instanceIds.size()+1) query.append("&");
+                    }
+                    request.setQuery(query.toString());
+                    recordList = ec2Adapter.search(request);             
+                } else {
+                    // Build structure
+                    StringBuilder structure = new StringBuilder();
+                    structure.append(entry.getKey().substring(0,1).toUpperCase());
+                    structure.append(entry.getKey().substring(1)).append("s");
+                    // Build query
+                    StringBuilder complexQuery = new StringBuilder();
+                    complexQuery.append(entry.getKey()).append("s=[");
+                    complexQuery.append(StringUtils.join(complexObjects.get(entry.getKey()).keySet(),","));
+                    complexQuery.append("]");
+                    if (cluster != null) complexQuery.append("&cluster=").append(cluster);
+                    // Build the BridgeRequest
+                    BridgeRequest request = new BridgeRequest();
+                    request.setStructure(structure.toString());
+                    request.setQuery(complexQuery.toString());
+                    request.setFields(entry.getValue());
+                    // Make the request
+                    recordList = search(request);
                 }
+                
+                for (Record record : recordList.getRecords()) {
+                    String arn = record.getValue(structureId).toString();
+                    complexObjects.get(entry.getKey()).put(arn,record.getRecord());
+                }       
             }
             
             // Retrieve the objects related to the complex fields based on the corresponding Arn
             for (Record record : records) {
-                for (Map.Entry<String,List<String>> entry : complexFields.entrySet()) {
+                for (Map.Entry<String,ArrayList<String>> entry : complexFields.entrySet()) {
                     for (String complexField : entry.getValue()) {
-                        String arn = record.getValue(entry.getKey().concat("Arn")).toString();
-                        JSONObject json = (JSONObject)complexObjects.get(entry.getKey()).get(arn);
+                        String arn = entry.getKey().equals("instance") ? record.getValue("ec2InstanceId").toString() : record.getValue(entry.getKey().concat("Arn")).toString();
+                        Map json = (Map)complexObjects.get(entry.getKey()).get(arn);
                         record.getRecord().put(entry.getKey()+"."+complexField,json.get(complexField));
                     }
                 }
@@ -400,6 +430,119 @@ public class AmazonEcsAdapter implements BridgeAdapter {
         }
         
         return records;
+    }
+    
+    private static final Pattern NESTED_PATTERN = Pattern.compile(".*?\\[(.*?)\\]");
+    private List getSubfieldValues(String subfield, List valuesToCheck) {
+        List subfieldValues = new ArrayList(valuesToCheck);
+        for (Object value : new ArrayList(subfieldValues)) {
+            if (value instanceof Map<?,?>) {
+                subfieldValues.remove(value);
+                subfieldValues.add(((Map)value).get(subfield));
+            } else if (value instanceof List<?>) {
+                subfieldValues.remove(value);
+                // Check if it is a list of name/value hashes
+                boolean isNameValuePair = true;
+                for (Object o : (List)value) {
+                    if (o instanceof Map) {
+                        if (((Map) o).containsKey("name") && ((Map) o).containsKey("value")) {
+                            if (((Map) o).get("name").toString().equals(subfield)) {
+                                subfieldValues.add(((Map) o).get("value"));
+                            }
+                        } else {
+                            isNameValuePair = false;
+                            break;
+                        }
+                    }
+                }
+                // If it is not a list of name/value hashes
+                if (!isNameValuePair) {
+                    subfieldValues.addAll(getSubfieldValues(subfield,(List)value));
+                }
+            } else {
+                subfieldValues.remove(value);
+                break;
+            }
+        }
+        return subfieldValues;
+    }
+    
+    private List<Record> filterRecords(List<Record> records, String query) {
+        String[] queryParts = query.split("&");
+        
+        Set<String> fields = null;
+        if (!records.isEmpty()) fields = records.get(0).getRecord().keySet();
+        List<Record> filteredRecords = new ArrayList<Record>(records);
+        for (String part : queryParts) {
+            String[] parts = part.split("=");
+            String key = aliasedField(parts[0].trim());
+            String value = parts.length == 1 ? "" : parts[1].trim();
+            
+            for (Record record : new ArrayList<Record>(filteredRecords)) {
+                if (fields.contains(key) && !value.equals(record.getValue(key))) {
+                    // If doing client side filtering on a standard field and it doesn't match
+                    filteredRecords.remove(record);
+                } else if (!fields.contains(key) && key.matches(NESTED_PATTERN.pattern())) {
+                    // Parse the base field and subfields from the field string
+                    String base = key.substring(0,key.indexOf("["));
+                    Matcher matcher = NESTED_PATTERN.matcher(key);
+                    List<String> subfields = new ArrayList<String>();
+                    while (matcher.find()) {
+                        subfields.add(matcher.group(1));
+                    }
+                    
+                    // Make a copy of the record to step through and put the value of the base field
+                    // in the "valuesToCheck" list
+                    List valuesToCheck = Arrays.asList(record.getValue(base));
+                    for (String subfield : subfields) {
+                        valuesToCheck = getSubfieldValues(subfield, valuesToCheck);
+                    }
+                    
+                    // Iterate through the list of values, and if all of them fail to match remove the record
+                    boolean valueMatch = false;
+                    for (Object valueCheck : valuesToCheck) {
+                        if (value.equals(valueCheck)) {
+                            valueMatch = true;
+                            break;
+                        }
+                    }
+                    if (!valueMatch) filteredRecords.remove(record);
+                }
+            }
+        }
+        return filteredRecords;
+    }
+    
+    // With the field pattern aliases, group the part of the query that you want to be aliases/replaced.
+    // For example, environment[space_slug] => overrides[containerOverrides][environment][space_slug]
+    // will be grouped on environment because that is what will be replaced by the real field.
+    private static final Map<Pattern,String> FLD_PATTERN_ALIASES = new HashMap<Pattern,String>() {{
+        put(Pattern.compile("(environment)\\[.*?\\]"),"overrides[containerOverrides][environment]");
+    }};
+    /**
+     * Returns the full field that is being aliased (if there is one). Echos back the passed in field
+     * if it is not representing an aliased value.
+     * @param fieldName A field alias
+     * @return The full field path
+     */
+    private String aliasedField(String fieldName) {
+        String aliasedField = fieldName;
+        // Check for complete field matches that are being aliased
+        
+        // Check for pattern matched aliases
+        for (Map.Entry<Pattern,String> entry : FLD_PATTERN_ALIASES.entrySet()) {
+            Matcher m = entry.getKey().matcher(fieldName);
+            if (m.find()) aliasedField = aliasedField.replace(m.group(1), entry.getValue());
+        }
+        return aliasedField;
+    }
+    
+    private List<String> aliasedFields(List<String> fieldNames) {
+        List<String> aliasedFields = new ArrayList<String>();
+        for (String fieldName : fieldNames) {
+            aliasedFields.add(fieldName);
+        }
+        return aliasedFields;
     }
     
     /**
