@@ -11,6 +11,17 @@
         <connection>scm:git:https://github.com/kineticcommunity/kinetic-bridgehub-adapter-amazonecs.git</connection>
         <developerConnection>scm:git:https://github.com/kineticcommunity/kinetic-bridgehub-adapter-amazonecs.git</developerConnection>
     </scm>
+    
+    <distributionManagement>
+        <repository>
+            <id>com.kineticdata</id>
+            <url>http://utilities.kineticdata.com/nexus/content/repositories/releases/</url>
+        </repository>
+        <snapshotRepository>
+          <id>com.kineticdata.snapshots</id>
+          <url>http://utilities.kineticdata.com/nexus/content/repositories/snapshots</url>
+        </snapshotRepository>
+    </distributionManagement>
 
     <repositories>
         <repository>
