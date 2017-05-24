@@ -3,7 +3,6 @@ package com.kineticdata.bridgehub.adapter.amazonecs;
 import com.kineticdata.bridgehub.adapter.BridgeAdapter;
 import com.kineticdata.bridgehub.adapter.BridgeError;
 import com.kineticdata.bridgehub.adapter.BridgeRequest;
-import com.kineticdata.bridgehub.adapter.BridgeUtils;
 import com.kineticdata.bridgehub.adapter.Count;
 import com.kineticdata.bridgehub.adapter.Record;
 import com.kineticdata.bridgehub.adapter.RecordList;
@@ -22,6 +21,7 @@ import java.text.DateFormat;
 import java.text.SimpleDateFormat;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Collections;
 import java.util.HashMap;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -270,9 +270,49 @@ public class AmazonEcsAdapter implements BridgeAdapter {
         // Define the fields - if not fields were passed, set they keySet of the a returned objects as
         // the field set
         List<String> fields = request.getFields();
-        if ((fields == null || fields.isEmpty()) && !records.isEmpty()) fields = new ArrayList<String>(records.get(0).getRecord().keySet());
+        Map<String,String> aliasedFields = new HashMap<String,String>();
+        if ((fields == null || fields.isEmpty()) && !records.isEmpty()) {
+            fields = new ArrayList<String>(records.get(0).getRecord().keySet());
+        } else {
+            for (String field : fields) {
+                String aliasedField = aliasedField(field);
+                if (!field.equals(aliasedField)) aliasedFields.put(field,aliasedField);
+            }
+        }
         
-        records = BridgeUtils.getNestedFields(fields, records);
+        for (String field : fields) {
+            String aliasedField = aliasedFields.containsKey(field) ? aliasedFields.get(field) : field;
+            if (field.matches(NESTED_PATTERN.pattern())) {
+                // Parse the base field and subfields from the field string
+                String base = aliasedField.substring(0,aliasedField.indexOf("["));
+                Matcher matcher = NESTED_PATTERN.matcher(aliasedField);
+                List<String> subfields = new ArrayList<String>();
+                while (matcher.find()) {
+                    subfields.add(matcher.group(1));
+                }
+                
+                // Make a copy of the record to step through and put the value of the base field
+                // in the "valuesToCheck" list
+                for (Record record : records) {
+                    List valuesToCheck = new ArrayList();
+                    valuesToCheck.add(record.getValue(base));
+                    for (String subfield : subfields) {
+                        valuesToCheck = getSubfieldValues(subfield, valuesToCheck);
+                    }
+                    
+                    // Remove any null values are are currently in valuesToCheck
+                    valuesToCheck.removeAll(Collections.singleton(null));
+                    if (valuesToCheck.size() > 1) {
+                        record.getRecord().put(field,valuesToCheck);
+                    } else if (valuesToCheck.size() == 1) {
+                        record.getRecord().put(field,valuesToCheck.get(0));
+                    } else {
+                        record.getRecord().put(field,null);
+                    }
+                }
+            }
+        }
+        
         records = filterRecords(records,query);
         
         // Define the metadata
@@ -442,7 +482,7 @@ public class AmazonEcsAdapter implements BridgeAdapter {
             } else if (value instanceof List<?>) {
                 subfieldValues.remove(value);
                 // Check if it is a list of name/value hashes
-                boolean isNameValuePair = true;
+                List nonNameValuePairObjects = new ArrayList();
                 for (Object o : (List)value) {
                     if (o instanceof Map) {
                         if (((Map) o).containsKey("name") && ((Map) o).containsKey("value")) {
@@ -450,14 +490,14 @@ public class AmazonEcsAdapter implements BridgeAdapter {
                                 subfieldValues.add(((Map) o).get("value"));
                             }
                         } else {
-                            isNameValuePair = false;
+                            nonNameValuePairObjects.add(o);
                             break;
                         }
                     }
                 }
                 // If it is not a list of name/value hashes
-                if (!isNameValuePair) {
-                    subfieldValues.addAll(getSubfieldValues(subfield,(List)value));
+                if (!nonNameValuePairObjects.isEmpty()) {
+                    subfieldValues.addAll(getSubfieldValues(subfield,nonNameValuePairObjects));
                 }
             } else {
                 subfieldValues.remove(value);
@@ -540,7 +580,7 @@ public class AmazonEcsAdapter implements BridgeAdapter {
     private List<String> aliasedFields(List<String> fieldNames) {
         List<String> aliasedFields = new ArrayList<String>();
         for (String fieldName : fieldNames) {
-            aliasedFields.add(fieldName);
+            aliasedFields.add(aliasedField(fieldName));
         }
         return aliasedFields;
     }
