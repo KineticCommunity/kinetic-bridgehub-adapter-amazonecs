@@ -3,6 +3,7 @@ package com.kineticdata.bridgehub.adapter.amazonecs;
 import com.kineticdata.bridgehub.adapter.BridgeAdapter;
 import com.kineticdata.bridgehub.adapter.BridgeError;
 import com.kineticdata.bridgehub.adapter.BridgeRequest;
+import com.kineticdata.bridgehub.adapter.BridgeUtils;
 import com.kineticdata.bridgehub.adapter.Count;
 import com.kineticdata.bridgehub.adapter.Record;
 import com.kineticdata.bridgehub.adapter.RecordList;
@@ -201,35 +202,57 @@ public class AmazonEcsAdapter implements BridgeAdapter {
         AmazonEcsQualificationParser parser = new AmazonEcsQualificationParser();
         String query = parser.parse(request.getQuery(),request.getParameters());
         
+        // Initialize the nextPageToken and pageSize variables
+        String nextPageToken = null;
+        String pageSize = request.getMetadata("pageSize") == null ? "0" : request.getMetadata("pageSize");
+        
         // Build the response structure key identifier by lowercase the first letter of the structure
         String structureKeyIdentifier = structure.substring(0, 1).toLowerCase().concat(structure.substring(1,structure.length()-1));
         
         Matcher arnsMatcher =Pattern.compile(structureKeyIdentifier+"Arns=\\[(.*?)\\]").matcher(query);
-        List<String> structureArns = new ArrayList<String>();
+        // Keep the list of each chunk of structureArns that were retrieved (with a max of 100)
+        // so that when the Describe call is done we don't try to describe more Arns that ECS
+        // allows in one call
+        List<List<String>> structureArnChunks = new ArrayList<List<String>>();
         if (arnsMatcher.find()) {
             String arns = arnsMatcher.group(1);
-            structureArns = Arrays.asList(arns.split(","));
+            structureArnChunks.add(Arrays.asList(arns.split(",")));
         } else {
             // Make the call to ECS to retrieve the Arns matching the query
-            JSONObject arnsJson = ecsRequest("List"+structure,query);
+            nextPageToken = request.getMetadata("pageToken");
+            do {
+                if (nextPageToken != null) {
+                    if (!query.isEmpty()) query = query.concat("&");
+                    query = query.concat("nextToken=").concat(nextPageToken);
+                }
+                if (!pageSize.equals("0")) {
+                    if (!query.isEmpty()) query = query.concat("&");
+                    query = query.concat("maxResults=").concat(pageSize);
+                }
+                
+                JSONObject arnsJson = ecsRequest("List"+structure,query);
+                nextPageToken = (String)arnsJson.get("nextToken");
             
-            // Parse through and retrieve the structure Arns that match the query
-            JSONArray structureArnsXml = (JSONArray)arnsJson.get(structureKeyIdentifier.concat("Arns"));
-            for (Object o : structureArnsXml) {
-                structureArns.add(o.toString());
-            }
+                // Parse through and retrieve the structure Arns that match the query
+                List<String> structureArns = new ArrayList<String>();
+                JSONArray structureArnsJson = (JSONArray)arnsJson.get(structureKeyIdentifier.concat("Arns"));
+                for (Object o : structureArnsJson) {
+                    structureArns.add(o.toString());
+                }
+                structureArnChunks.add(structureArns);
+            } while (nextPageToken != null && pageSize.equals("0"));
+        }
+        
+        // Retrieve the cluster from the original query to append to the describe query (if it was
+        // originally included)
+        String cluster = null;
+        if (!structure.equals("Clusters") && !structure.equals("TaskDefinitions")) {
+            Matcher m = Pattern.compile("cluster=(.*?)(?:&|\\z)").matcher(query);
+            if (m.find()) cluster = m.group(1);
         }
         
         List<Record> records = new ArrayList<Record>();
-        if (!structureArns.isEmpty()) {
-            // Retrieve the cluster from the original query to append to the describe query (if it was
-            // originally included)
-            String cluster = null;
-            if (!structure.equals("Clusters") && !structure.equals("TaskDefinitions")) {
-                Matcher m = Pattern.compile("cluster=(.*?)(?:&|\\z)").matcher(query);
-                if (m.find()) cluster = m.group(1);
-            }
-
+        for (List<String> structureArns : structureArnChunks) {
             // Make the call to ECS retrieve the record objects for the returned Arns
             JSONArray structureObjs;
             if (structure.equals("TaskDefinitions")) {
@@ -252,19 +275,19 @@ public class AmazonEcsAdapter implements BridgeAdapter {
             for (Object o : structureObjs) {
                 records.add(new Record((Map)o));
             }
-            
-            // Get other structure fields add to the record objects if they were included in the
-            // fields list or were included as a field to query by
-            Matcher matchStructureFields = Pattern.compile("(?:\\A|&)([^&]*?\\..*?)=(?:.*?)(?:\\z|&)").matcher(query);
-            List<String> retrievalFields = new ArrayList<String>();
-            while (matchStructureFields.find()) {
-                retrievalFields.add(matchStructureFields.group(1));
-            }
-            
-            if ((request.getFields() != null && !request.getFields().isEmpty()) || !retrievalFields.isEmpty()) {
-                if (request.getFields() != null) retrievalFields.addAll(request.getFields());
-                records = addOtherStructureFields(retrievalFields,records,cluster);
-            }
+        }
+        
+        // Get other structure fields add to the record objects if they were included in the
+        // fields list or were included as a field to query by
+        Matcher matchStructureFields = Pattern.compile("(?:\\A|&)([^&]*?\\..*?)=(?:.*?)(?:\\z|&)").matcher(query);
+        List<String> retrievalFields = new ArrayList<String>();
+        while (matchStructureFields.find()) {
+            retrievalFields.add(matchStructureFields.group(1));
+        }
+
+        if ((request.getFields() != null && !request.getFields().isEmpty()) || !retrievalFields.isEmpty()) {
+            if (request.getFields() != null) retrievalFields.addAll(request.getFields());
+            records = addOtherStructureFields(retrievalFields,records,cluster);
         }
         
         // Define the fields - if not fields were passed, set they keySet of the a returned objects as
@@ -318,7 +341,8 @@ public class AmazonEcsAdapter implements BridgeAdapter {
         // Define the metadata
         Map<String,String> metadata = new LinkedHashMap<String,String>();
         metadata.put("size",String.valueOf(records.size()));
-        metadata.put("nextPageToken",null);
+        metadata.put("pageSize",pageSize);
+        metadata.put("nextPageToken",nextPageToken);
 
         // Returning the response
         return new RecordList(fields, records, metadata);
@@ -339,6 +363,8 @@ public class AmazonEcsAdapter implements BridgeAdapter {
                 // If the value is surrounded by [ ] it should be turned into a string list
                 if (value.startsWith("[") && value.endsWith("]")) {
                     jsonQuery.put(key,Arrays.asList(value.substring(1,value.length()-1).split(",")));
+                } else if (key.equals("maxResults")) {
+                    jsonQuery.put(key,Integer.valueOf(value));
                 } else {
                     jsonQuery.put(key,value);
                 }
