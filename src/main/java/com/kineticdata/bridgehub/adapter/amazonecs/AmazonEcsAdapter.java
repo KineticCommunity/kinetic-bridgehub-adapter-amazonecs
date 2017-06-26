@@ -23,6 +23,7 @@ import java.text.SimpleDateFormat;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
+import java.util.Comparator;
 import java.util.HashMap;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -35,6 +36,7 @@ import javax.crypto.spec.SecretKeySpec;
 import org.apache.commons.codec.binary.Hex;
 import org.apache.commons.codec.digest.*;
 import org.apache.commons.lang.StringUtils;
+import org.apache.commons.lang.builder.CompareToBuilder;
 import org.apache.http.HttpResponse;
 import org.apache.http.client.HttpClient;
 import org.apache.http.client.methods.HttpGet;
@@ -336,7 +338,20 @@ public class AmazonEcsAdapter implements BridgeAdapter {
             }
         }
         
+        // Filter and sort the records
         records = filterRecords(records,query);
+        if (request.getMetadata("order") == null) {
+            // name,type,desc assumes name ASC,type ASC,desc ASC
+            Map<String,String> defaultOrder = new LinkedHashMap<String,String>();
+            for (String field : fields) {
+                defaultOrder.put(field, "ASC");
+            }
+            records = BridgeUtils.sortRecords(defaultOrder, records);
+        } else {
+            // Creates a map out of order metadata
+            Map<String,String> orderParse = BridgeUtils.parseOrder(request.getMetadata("order"));
+            records = BridgeUtils.sortRecords(orderParse, records);
+        }
         
         // Define the metadata
         Map<String,String> metadata = new LinkedHashMap<String,String>();
